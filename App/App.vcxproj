@@ -78,7 +78,9 @@
     <ClCompile Include="..\src\main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\src\ac.hpp" />
     <ClInclude Include="..\src\mem.hpp" />
+    <ClInclude Include="..\src\process.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
