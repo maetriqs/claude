@@ -79,6 +79,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\ac.hpp" />
+    <ClInclude Include="..\src\display.hpp" />
+    <ClInclude Include="..\src\features.hpp" />
     <ClInclude Include="..\src\mem.hpp" />
     <ClInclude Include="..\src\process.hpp" />
   </ItemGroup>

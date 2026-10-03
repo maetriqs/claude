@@ -19,6 +19,12 @@
     <ClInclude Include="..\src\ac.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\display.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\features.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\mem.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>

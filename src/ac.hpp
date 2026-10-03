@@ -1,7 +1,12 @@
 // By The_headphones
 #pragma once
 #include <cstdint>
+#include <string>
+#include <cmath>
 #include "mem.hpp"
+
+struct Vec3 { float x = 0, y = 0, z = 0; };
+inline float dist2d(Vec3 a, Vec3 b) { float dx=a.x-b.x, dz=a.z-b.z; return std::sqrt(dx*dx+dz*dz); }
 
 // ── static offsets (from ac_client.exe base) ────────────────────────────────
 namespace AC {
@@ -77,6 +82,14 @@ struct ACGame
     float posX(uintptr_t ent) const { float v=0; proc.read(ent+Ent::POS_X,v); return v; }
     float posY(uintptr_t ent) const { float v=0; proc.read(ent+Ent::POS_Y,v); return v; }
     float posZ(uintptr_t ent) const { float v=0; proc.read(ent+Ent::POS_Z,v); return v; }
+
+    Vec3 pos(uintptr_t ent) const { return { posX(ent), posY(ent), posZ(ent) }; }
+    void setPos(uintptr_t ent, Vec3 p)
+    {
+        proc.write(ent + Ent::POS_X, p.x);
+        proc.write(ent + Ent::POS_Y, p.y);
+        proc.write(ent + Ent::POS_Z, p.z);
+    }
 
     float headX(uintptr_t ent) const { float v=0; proc.read(ent+Ent::HEAD_X,v); return v; }
     float headY(uintptr_t ent) const { float v=0; proc.read(ent+Ent::HEAD_Y,v); return v; }

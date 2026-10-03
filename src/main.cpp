@@ -1,127 +1,201 @@
 // By The_headphones
 #include <Windows.h>
+#include <conio.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
 #include <string>
+#include <array>
+#include <chrono>
+#include <thread>
+#include <optional>
 #include "mem.hpp"
 #include "process.hpp"
 #include "ac.hpp"
+#include "features.hpp"
+#include "display.hpp"
+
+// ── Globals ──────────────────────────────────────────────────────────────────
+
+static Process  proc;
+static uintptr_t base    = 0;
+static bool     attached = false;
+static Features fx;
+static std::array<std::optional<Vec3>, 5> savedPos;
+
+// ── Utilities ────────────────────────────────────────────────────────────────
 
 static std::string lastError()
 {
     char buf[256] = {};
     FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr, GetLastError(), 0, buf, sizeof(buf), nullptr);
-    // trim newline
-    for (auto& c : buf) if (c == '\r' || c == '\n') c = ' ';
+    for (auto& c : buf) if (c=='\r'||c=='\n') c=' ';
     return buf;
 }
 
+static bool tryAttach()
+{
+    DWORD pid = findPid("ac_client.exe");
+    if (!pid) { std::cout << "ac_client.exe not found\n"; return false; }
+    if (!proc.open(pid))
+    { std::cout << "OpenProcess failed: " << lastError() << "\n"; return false; }
+    base = getModuleBase(pid, "ac_client.exe");
+    if (!base)
+    { std::cout << "module base not found\n"; proc.close(); return false; }
+    attached = true;
+    std::cout << "attached  pid=" << pid
+              << "  base=0x" << std::hex << base << std::dec << "\n";
+    return true;
+}
+
+static void doDetach()
+{
+    fx.stopAll();
+    proc.close();
+    base = 0;
+    attached = false;
+    std::cout << "detached\n";
+}
+
+// Require the game to be attached and return a ready ACGame, or print an error.
+#define NEED_AC(name) \
+    if (!attached) { std::cout << "not attached — run 'attach'\n"; continue; } \
+    ACGame name { proc, base };
+
+// ── Help ─────────────────────────────────────────────────────────────────────
+
 static void printHelp()
 {
-    std::cout <<
-        "\nCommands:\n"
-        "  attach                attach to ac_client.exe\n"
-        "  detach                release handle\n"
-        "  status                print player/game state\n"
-        "  players               list all players\n"
-        "  set hp     <val>      set local player health\n"
-        "  set armor  <val>      set local player armor\n"
-        "  set ammo   <gun> <val> set ammo (ar/smg/sniper/shotgun/pistol/grenade/carbine/all)\n"
-        "  set fov    <val>      set field of view\n"
-        "  set ff     <gun> <on|off>  fast fire (ar/sniper/shotgun)\n"
-        "  set autoshoot <on|off>\n"
-        "  help\n"
-        "  quit\n\n"
-        "Run as Administrator.\n\n";
+    std::cout << R"(
+  ATTACHMENT
+    attach                    find and open ac_client.exe
+    detach                    stop all loops, close handle
+
+  DISPLAY
+    status                    local player stats + ammo
+    players                   table of all players (with dist + HP bar)
+    radar [scale]             ASCII top-down radar  (default scale=12)
+    watch [ms]                live-refresh status+radar (any key to stop)
+
+  SET (local player)
+    set hp      <val>
+    set armor   <val>
+    set ammo    <gun|all> <val>    guns: ar smg sniper shotgun pistol grenade carbine
+    set fov     <val>
+    set ff      <gun> <on|off>     fast fire: ar sniper shotgun
+    set autoshoot <on|off>
+    set pos     <x> <y> <z>        teleport
+
+  POSITION SLOTS  (0-4)
+    savepos [slot]            save current position (default slot 0)
+    loadpos [slot]            teleport to saved position
+    slots                     list all saved positions
+
+  LOOPS
+    godmode  <on|off>         continuously write HP=200 Armor=200
+    infammo  <on|off>         continuously top up all ammo
+    freeze   <idx> <on|off>   lock an entity's position
+    loops                     show active background loops
+
+  COMBAT
+    kill     <idx|all>        set health to 0
+
+  MISC
+    dump     [file]           write all player data to a file
+    help
+    quit
+)";
 }
 
-static uintptr_t ammoSlot(const std::string& gun)
+// ── Watch mode ───────────────────────────────────────────────────────────────
+
+static void doWatch(int intervalMs)
 {
-    if (gun == "ar")      return Ent::AMMO_AR;
-    if (gun == "smg")     return Ent::AMMO_SMG;
-    if (gun == "sniper")  return Ent::AMMO_SNIPER;
-    if (gun == "shotgun") return Ent::AMMO_SHOTGUN;
-    if (gun == "pistol")  return Ent::AMMO_PISTOL;
-    if (gun == "grenade") return Ent::AMMO_GRENADE;
-    if (gun == "carbine") return Ent::AMMO_CARBINE;
-    return 0;
+    consoleClear();
+    hideCursor();
+    std::cout << "\033[1;1H  [Watch — any key to stop]\n";
+
+    while (!_kbhit())
+    {
+        consoleHome();
+        std::cout << "  [Watch — any key to stop]\n";
+        ACGame ac { proc, base };
+        printStatus(ac);
+        printRadar(ac);
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+    }
+    _getch();
+    showCursor();
+    consoleClear();
 }
 
-static uintptr_t ffSlot(const std::string& gun)
-{
-    if (gun == "ar")      return Ent::FF_AR;
-    if (gun == "sniper")  return Ent::FF_SNIPER;
-    if (gun == "shotgun") return Ent::FF_SHOTGUN;
-    return 0;
-}
+// ── Dump ─────────────────────────────────────────────────────────────────────
 
-static void printStatus(const ACGame& ac)
+static void doDump(const ACGame& ac, const std::string& path)
 {
+    std::ofstream f(path);
+    if (!f) { std::cout << "cannot open " << path << "\n"; return; }
+
     uintptr_t lp = ac.localPlayer();
-    if (!lp) { std::cout << "LocalPlayer pointer is null — is the game in a match?\n"; return; }
-
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout
-        << "\n=== Local Player  [" << ac.name(lp) << "] ===\n"
-        << "  HP:     " << ac.health(lp) << "\n"
-        << "  Armor:  " << ac.armor(lp)  << "\n"
-        << "  Pos:    X=" << ac.posX(lp) << "  Y=" << ac.posY(lp) << "  Z=" << ac.posZ(lp) << "\n"
-        << "  Head:   X=" << ac.headX(lp)<< "  Y=" << ac.headY(lp)<< "  Z=" << ac.headZ(lp)<< "\n"
-        << "\n=== Ammo ===\n"
-        << "  AR="      << ac.ammo(lp, Ent::AMMO_AR)
-        << "  SMG="     << ac.ammo(lp, Ent::AMMO_SMG)
-        << "  Sniper="  << ac.ammo(lp, Ent::AMMO_SNIPER)
-        << "  Shotgun=" << ac.ammo(lp, Ent::AMMO_SHOTGUN)
-        << "\n"
-        << "  Pistol="  << ac.ammo(lp, Ent::AMMO_PISTOL)
-        << "  Grenade=" << ac.ammo(lp, Ent::AMMO_GRENADE)
-        << "  Carbine=" << ac.ammo(lp, Ent::AMMO_CARBINE)
-        << "\n"
-        << "\n=== Server ===\n"
-        << "  Players: " << ac.playerCount() << "\n"
-        << "  FOV:     " << ac.fov() << "\n\n";
-}
-
-static void printPlayers(const ACGame& ac)
-{
+    f << std::fixed << std::setprecision(3);
+    f << "=== LocalPlayer ===\n";
+    if (lp)
+    {
+        f << "Name:   " << ac.name(lp) << "\n"
+          << "HP:     " << ac.health(lp) << "\n"
+          << "Armor:  " << ac.armor(lp)  << "\n"
+          << "Pos:    " << ac.posX(lp) << " " << ac.posY(lp) << " " << ac.posZ(lp) << "\n"
+          << "Head:   " << ac.headX(lp) << " " << ac.headY(lp) << " " << ac.headZ(lp) << "\n"
+          << "Cam:    " << ac.posX(lp) << " " << ac.posY(lp) << "\n"; // cam uses pos offsets
+    }
+    f << "\n=== Entities ===\n";
     int count = ac.playerCount();
-    std::cout << "\n" << count << " player(s):\n";
-    std::cout << std::fixed << std::setprecision(1);
     for (int i = 0; i < count; ++i)
     {
         uintptr_t ent = ac.entity(i);
         if (!ent) continue;
-        std::cout
-            << "  [" << i << "] " << std::setw(16) << std::left << ac.name(ent)
-            << "  HP=" << std::setw(4) << ac.health(ent)
-            << "  Armor=" << std::setw(4) << ac.armor(ent)
-            << "  Pos=(" << ac.posX(ent) << ", " << ac.posY(ent) << ", " << ac.posZ(ent) << ")\n";
+        Vec3 p = ac.pos(ent);
+        f << "[" << i << "] " << ac.name(ent)
+          << "  HP=" << ac.health(ent)
+          << "  Armor=" << ac.armor(ent)
+          << "  Pos=" << p.x << "," << p.y << "," << p.z
+          << "  Dist=" << dist2d(lp ? ac.pos(lp) : Vec3{}, p) << "\n";
     }
-    std::cout << "\n";
+    f << "\nFOV: " << ac.fov() << "\n";
+    std::cout << "dumped to " << path << "\n";
 }
+
+// ── Ammo / fast-fire slot lookup ─────────────────────────────────────────────
+
+static uintptr_t ammoSlot(const std::string& g)
+{
+    if (g=="ar")      return Ent::AMMO_AR;
+    if (g=="smg")     return Ent::AMMO_SMG;
+    if (g=="sniper")  return Ent::AMMO_SNIPER;
+    if (g=="shotgun") return Ent::AMMO_SHOTGUN;
+    if (g=="pistol")  return Ent::AMMO_PISTOL;
+    if (g=="grenade") return Ent::AMMO_GRENADE;
+    if (g=="carbine") return Ent::AMMO_CARBINE;
+    return 0;
+}
+
+static uintptr_t ffSlot(const std::string& g)
+{
+    if (g=="ar")      return Ent::FF_AR;
+    if (g=="sniper")  return Ent::FF_SNIPER;
+    if (g=="shotgun") return Ent::FF_SHOTGUN;
+    return 0;
+}
+
+// ── Main loop ────────────────────────────────────────────────────────────────
 
 int main()
 {
     SetConsoleOutputCP(CP_UTF8);
-    std::cout << "AssaultCube tool  --  type 'help' for commands\n";
-
-    Process proc;
-    uintptr_t base = 0;
-    bool attached = false;
-
-    auto tryAttach = [&]() -> bool {
-        DWORD pid = findPid("ac_client.exe");
-        if (!pid) { std::cout << "ac_client.exe not found\n"; return false; }
-        if (!proc.open(pid)) { std::cout << "OpenProcess failed: " << lastError() << "\n"; return false; }
-        base = getModuleBase(pid, "ac_client.exe");
-        if (!base) { std::cout << "couldn't read module base\n"; proc.close(); return false; }
-        std::cout << "attached  pid=" << pid
-                  << "  base=0x" << std::hex << base << std::dec << "\n";
-        attached = true;
-        return true;
-    };
+    enableAnsi();
+    std::cout << "AssaultCube tool  --  type 'help'\n";
 
     std::string line;
     while (true)
@@ -130,102 +204,226 @@ int main()
         if (!std::getline(std::cin, line)) break;
 
         std::istringstream ss(line);
-        std::string cmd;
-        ss >> cmd;
+        std::string cmd; ss >> cmd;
         if (cmd.empty()) continue;
-        if (cmd == "quit" || cmd == "exit") break;
-        if (cmd == "help") { printHelp(); continue; }
+        if (cmd=="quit"||cmd=="exit") break;
 
-        if (cmd == "attach") { tryAttach(); continue; }
-
-        if (cmd == "detach")
-        {
-            proc.close(); base = 0; attached = false;
-            std::cout << "detached\n";
-            continue;
+        // ── no-attach commands ───────────────────────────────────────────────
+        if (cmd == "help")  { printHelp(); continue; }
+        if (cmd == "loops") {
+            if (!attached) { std::cout << "not attached\n"; continue; }
+            fx.printStatus(); continue;
         }
+        if (cmd == "attach") { tryAttach(); continue; }
+        if (cmd == "detach") { doDetach(); continue; }
 
-        if (!attached) { std::cout << "not attached (run 'attach')\n"; continue; }
+        // ── require attachment ───────────────────────────────────────────────
+        NEED_AC(ac)
 
-        ACGame ac{ proc, base };
-
+        // ── display ──────────────────────────────────────────────────────────
         if (cmd == "status")
         {
             printStatus(ac);
         }
         else if (cmd == "players")
         {
-            printPlayers(ac);
+            printPlayersTable(ac);
         }
+        else if (cmd == "radar")
+        {
+            float scale = 12.0f;
+            ss >> scale;
+            printRadar(ac, scale);
+        }
+        else if (cmd == "watch")
+        {
+            int ms = 500;
+            ss >> ms;
+            ms = std::max(100, ms);
+            doWatch(ms);
+        }
+
+        // ── loops ────────────────────────────────────────────────────────────
+        else if (cmd == "godmode")
+        {
+            std::string onoff; ss >> onoff;
+            if (onoff == "on") {
+                if (fx.godmode.running()) { std::cout << "already on\n"; continue; }
+                fx.godmode.start(&proc, base);
+                std::cout << "godmode on\n";
+            } else {
+                fx.godmode.stop();
+                std::cout << "godmode off\n";
+            }
+        }
+        else if (cmd == "infammo")
+        {
+            std::string onoff; ss >> onoff;
+            if (onoff == "on") {
+                if (fx.infammo.running()) { std::cout << "already on\n"; continue; }
+                fx.infammo.start(&proc, base);
+                std::cout << "infammo on\n";
+            } else {
+                fx.infammo.stop();
+                std::cout << "infammo off\n";
+            }
+        }
+        else if (cmd == "freeze")
+        {
+            int idx; std::string onoff;
+            ss >> idx >> onoff;
+            if (idx < 0 || idx >= 8)
+            { std::cout << "idx must be 0-7\n"; continue; }
+
+            if (onoff == "on") {
+                uintptr_t ent = ac.entity(idx);
+                if (!ent) { std::cout << "entity " << idx << " not found\n"; continue; }
+                Vec3 p = ac.pos(ent);
+                fx.freeze[idx].stop();
+                fx.freeze[idx].start(&proc, base, idx, p);
+                std::cout << "freeze[" << idx << "] on at ("
+                    << p.x << ", " << p.y << ", " << p.z << ")\n";
+            } else {
+                fx.freeze[idx].stop();
+                std::cout << "freeze[" << idx << "] off\n";
+            }
+        }
+
+        // ── combat ───────────────────────────────────────────────────────────
+        else if (cmd == "kill")
+        {
+            std::string target; ss >> target;
+            if (target == "all") {
+                int count = ac.playerCount();
+                uintptr_t lp = ac.localPlayer();
+                for (int i = 0; i < count; ++i) {
+                    uintptr_t ent = ac.entity(i);
+                    if (!ent || ent == lp) continue;
+                    ac.setHealth(ent, 0);
+                }
+                std::cout << "killed all enemies\n";
+            } else {
+                int idx = std::stoi(target);
+                uintptr_t ent = ac.entity(idx);
+                if (!ent) { std::cout << "entity not found\n"; continue; }
+                ac.setHealth(ent, 0);
+                std::cout << "killed [" << idx << "]\n";
+            }
+        }
+
+        // ── position slots ───────────────────────────────────────────────────
+        else if (cmd == "savepos")
+        {
+            int slot = 0; ss >> slot;
+            slot = std::clamp(slot, 0, 4);
+            uintptr_t lp = ac.localPlayer();
+            if (!lp) { std::cout << "LocalPlayer null\n"; continue; }
+            savedPos[slot] = ac.pos(lp);
+            Vec3& p = *savedPos[slot];
+            std::cout << "slot " << slot << " saved ("
+                << p.x << ", " << p.y << ", " << p.z << ")\n";
+        }
+        else if (cmd == "loadpos")
+        {
+            int slot = 0; ss >> slot;
+            slot = std::clamp(slot, 0, 4);
+            if (!savedPos[slot]) { std::cout << "slot " << slot << " empty\n"; continue; }
+            uintptr_t lp = ac.localPlayer();
+            if (!lp) { std::cout << "LocalPlayer null\n"; continue; }
+            ac.setPos(lp, *savedPos[slot]);
+            Vec3& p = *savedPos[slot];
+            std::cout << "teleported to slot " << slot
+                << " (" << p.x << ", " << p.y << ", " << p.z << ")\n";
+        }
+        else if (cmd == "slots")
+        {
+            std::cout << std::fixed << std::setprecision(2);
+            for (int i = 0; i < 5; ++i) {
+                std::cout << "  slot " << i << ": ";
+                if (savedPos[i])
+                    std::cout << "(" << savedPos[i]->x << ", "
+                              << savedPos[i]->y << ", " << savedPos[i]->z << ")\n";
+                else
+                    std::cout << "(empty)\n";
+            }
+        }
+
+        // ── set ──────────────────────────────────────────────────────────────
         else if (cmd == "set")
         {
             uintptr_t lp = ac.localPlayer();
-            if (!lp) { std::cout << "LocalPlayer is null\n"; continue; }
-
+            if (!lp) { std::cout << "LocalPlayer null\n"; continue; }
             std::string sub; ss >> sub;
 
-            if (sub == "hp")
-            {
+            if (sub == "hp") {
                 int v; ss >> v;
                 ac.setHealth(lp, v);
                 std::cout << "hp = " << v << "\n";
             }
-            else if (sub == "armor")
-            {
+            else if (sub == "armor") {
                 int v; ss >> v;
                 ac.setArmor(lp, v);
                 std::cout << "armor = " << v << "\n";
             }
-            else if (sub == "fov")
-            {
+            else if (sub == "fov") {
                 int v; ss >> v;
                 ac.setFov(v);
                 std::cout << "fov = " << v << "\n";
             }
-            else if (sub == "ammo")
-            {
-                std::string gun; int v; ss >> gun >> v;
-                if (gun == "all")
-                {
+            else if (sub == "pos") {
+                float x, y, z;
+                ss >> x >> y >> z;
+                ac.setPos(lp, { x, y, z });
+                std::cout << "pos = (" << x << ", " << y << ", " << z << ")\n";
+            }
+            else if (sub == "ammo") {
+                std::string gun; int v;
+                ss >> gun >> v;
+                if (gun == "all") {
                     for (uintptr_t s : { Ent::AMMO_AR, Ent::AMMO_SMG, Ent::AMMO_SNIPER,
                                          Ent::AMMO_SHOTGUN, Ent::AMMO_PISTOL,
                                          Ent::AMMO_GRENADE, Ent::AMMO_CARBINE })
                         ac.setAmmo(lp, s, v);
                     std::cout << "all ammo = " << v << "\n";
-                }
-                else
-                {
-                    uintptr_t slot = ammoSlot(gun);
-                    if (!slot) { std::cout << "unknown gun\n"; continue; }
-                    ac.setAmmo(lp, slot, v);
+                } else {
+                    uintptr_t s = ammoSlot(gun);
+                    if (!s) { std::cout << "unknown gun\n"; continue; }
+                    ac.setAmmo(lp, s, v);
                     std::cout << gun << " ammo = " << v << "\n";
                 }
             }
-            else if (sub == "ff")
-            {
-                std::string gun, onoff; ss >> gun >> onoff;
-                uintptr_t slot = ffSlot(gun);
-                if (!slot) { std::cout << "unknown gun (ar/sniper/shotgun)\n"; continue; }
-                int v = (onoff == "on") ? 1 : 0;
-                ac.setFastFire(lp, slot, v);
-                std::cout << "fast fire " << gun << " = " << onoff << "\n";
+            else if (sub == "ff") {
+                std::string gun, onoff;
+                ss >> gun >> onoff;
+                uintptr_t s = ffSlot(gun);
+                if (!s) { std::cout << "unknown gun (ar/sniper/shotgun)\n"; continue; }
+                ac.setFastFire(lp, s, onoff == "on" ? 1 : 0);
+                std::cout << "fastfire " << gun << " = " << onoff << "\n";
             }
-            else if (sub == "autoshoot")
-            {
+            else if (sub == "autoshoot") {
                 std::string onoff; ss >> onoff;
-                ac.setAutoShoot(lp, (onoff == "on") ? 1 : 0);
+                ac.setAutoShoot(lp, onoff == "on" ? 1 : 0);
                 std::cout << "autoshoot = " << onoff << "\n";
             }
-            else
-            {
-                std::cout << "unknown set target (hp/armor/ammo/fov/ff/autoshoot)\n";
+            else {
+                std::cout << "unknown set target\n";
             }
         }
+
+        // ── dump ─────────────────────────────────────────────────────────────
+        else if (cmd == "dump")
+        {
+            std::string path = "ac_dump.txt";
+            ss >> path;
+            doDump(ac, path);
+        }
+
         else
         {
-            std::cout << "unknown command\n";
+            std::cout << "unknown command (type 'help')\n";
         }
     }
 
+    fx.stopAll();
     return 0;
 }
